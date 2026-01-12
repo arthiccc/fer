@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+*.db
+*.so
+*.a
+*.dylib
+*.dll
+.DS_Store
+android_bindings/
+bindings/
+node_modules/
