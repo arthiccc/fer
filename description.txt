@@ -1,0 +1,1 @@
+Ferrum Mobile (FER): High-performance Rust-native telco engine with 46μs state transitions and multi-platform UniFFI bindings.

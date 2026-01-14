@@ -5,8 +5,10 @@ use rusqlite::{params, Connection};
 use std::thread;
 use regex::Regex;
 use std::time::{SystemTime, UNIX_EPOCH};
-use secrecy::{SecretString, ExposeSecret};
+use secrecy::SecretString;
 use wasm_bindgen::prelude::*;
+
+use std::sync::mpsc;
 
 uniffi::setup_scaffolding!();
 
@@ -44,6 +46,8 @@ pub struct UserAccount {
     pub biometric_locked: bool,
     pub buckets: Vec<QuotaBucket>,
     pub last_traffic_bytes: u64,
+    pub data_balance_bytes: u64,
+    pub current_latency_ms: u32,
 }
 
 #[uniffi::export(callback_interface)]
@@ -51,13 +55,18 @@ pub trait TelcoLiveUpdateHandler: Send + Sync {
     fn on_account_updated(&self, account: UserAccount);
 }
 
+struct PersistenceMsg {
+    account: UserAccount,
+    usage: Option<(u64, QuotaType, u64)>,
+}
+
 #[wasm_bindgen]
 #[derive(uniffi::Object)]
 pub struct TelcoSimulator {
     state: Arc<RwLock<UserAccount>>,
-    db_path: String,
     db_key: Arc<RwLock<Option<SecretString>>>,
     update_handler: RwLock<Option<Box<dyn TelcoLiveUpdateHandler>>>,
+    persistence_tx: mpsc::SyncSender<PersistenceMsg>,
 }
 
 #[uniffi::export]
@@ -72,21 +81,63 @@ impl TelcoSimulator {
         ).map_err(|e| TelcoError::DatabaseError(e.to_string()))?;
 
         let account = load_account_internal(&conn, &id).unwrap_or_else(|_| {
-            UserAccount { id: id.clone(), is_active: true, biometric_locked: false, buckets: vec![], last_traffic_bytes: 0 }
+            UserAccount { 
+                id: id.clone(), 
+                is_active: true, 
+                biometric_locked: false, 
+                buckets: vec![], 
+                last_traffic_bytes: 0,
+                data_balance_bytes: 0,
+                current_latency_ms: 46,
+            }
+        });
+
+        let (tx, rx) = mpsc::sync_channel::<PersistenceMsg>(1000);
+        let db_path_clone = db_path.clone();
+        thread::spawn(move || {
+            if let Ok(mut conn) = Connection::open(db_path_clone) {
+                while let Ok(msg) = rx.recv() {
+                    if let Some((bytes, category, now)) = msg.usage {
+                        let _ = conn.execute("INSERT INTO usage_history (timestamp, amount, category) VALUES (?1, ?2, ?3)",
+                            params![now, bytes, format!("{:?}", category)]);
+                    }
+                    if let Ok(tx) = conn.transaction() {
+                        let _ = tx.execute("INSERT OR REPLACE INTO accounts (id, is_active, locked, last_traffic) VALUES (?1, ?2, ?3, ?4)", 
+                            params![msg.account.id, msg.account.is_active, msg.account.biometric_locked, msg.account.last_traffic_bytes]);
+                        let _ = tx.execute("DELETE FROM buckets WHERE account_id = ?1", params![msg.account.id]);
+                        for b in msg.account.buckets {
+                            let _ = tx.execute(
+                                "INSERT INTO buckets (account_id, name, remaining_bytes, category, expiry) VALUES (?1, ?2, ?3, ?4, ?5)",
+                                params![msg.account.id, b.name, b.remaining_bytes, format!("{:?}", b.category), b.expiry]
+                            );
+                        }
+                        let _ = tx.commit();
+                    }
+                }
+            }
         });
 
         Ok(Arc::new(Self { 
             state: Arc::new(RwLock::new(account)), 
-            db_path,
             db_key: Arc::new(RwLock::new(None)),
             update_handler: RwLock::new(None),
+            persistence_tx: tx,
         }))
+    }
+
+    pub fn set_update_handler(&self, handler: Box<dyn TelcoLiveUpdateHandler>) {
+        let mut lock = self.update_handler.write();
+        *lock = Some(handler);
+        let account = self.state.read().clone();
+        if let Some(h) = &*lock { h.on_account_updated(account); }
     }
 
     pub fn unlock_with_biometrics(&self) {
         let mut lock = self.state.write();
         lock.biometric_locked = false;
-        self.notify_and_persist(lock.clone());
+        let account = lock.clone();
+        drop(lock);
+        self.notify_and_persist(account, None);
     }
 
     pub fn secure_initialize(&self, key: String) {
@@ -102,7 +153,6 @@ impl TelcoSimulator {
 
     pub fn handle_command(&self, command: String) -> String {
         if self.state.read().biometric_locked { return "Unlock required.".to_string(); }
-        // Agentic Intent Logic
         let cmd = command.trim().to_lowercase();
         if cmd == "status" { return self.generate_insight(); }
         match self.parse_and_buy_topping(command) {
@@ -119,11 +169,10 @@ impl TelcoSimulator {
         let new_state = (*lock).consume_data(bytes, category)?;
         *lock = new_state;
         
-        if let Ok(db) = Connection::open(&self.db_path) {
-            let _ = db.execute("INSERT INTO usage_history (timestamp, amount, category) VALUES (?1, ?2, ?3)",
-                params![now, bytes, format!("{:?}", category)]);
-        }
-        self.notify_and_persist(lock.clone());
+        let account = lock.clone();
+        drop(lock);
+        
+        self.notify_and_persist(account, Some((bytes, category, now)));
         Ok(())
     }
 
@@ -149,16 +198,46 @@ impl TelcoSimulator {
             };
             let mut lock = self.state.write();
             lock.buckets.push(topping);
-            self.notify_and_persist((*lock).clone());
+            lock.data_balance_bytes = lock.buckets.iter().map(|b| b.remaining_bytes).sum();
+            let account = lock.clone();
+            drop(lock);
+            self.notify_and_persist(account, None);
             Ok(())
         } else {
             Err(TelcoError::InvalidCommand("Try 'YouTube 2GB'".to_string()))
         }
     }
+    pub fn start_network_sensor(self: Arc<Self>) {
+        thread::spawn(move || {
+            let mut last_bytes = 0;
+            loop {
+                if let Ok(content) = std::fs::read_to_string("/proc/net/dev") {
+                    for line in content.lines() {
+                        // Monitor common interfaces
+                        if line.contains("wlp3s0:") || line.contains("tun0:") || line.contains("eth0:") {
+                            let parts: Vec<&str> = line.split_whitespace().collect();
+                            if parts.len() > 1 {
+                                let bytes: u64 = parts[1].parse().unwrap_or(0);
+                                if last_bytes > 0 && bytes > last_bytes {
+                                    let diff = bytes - last_bytes;
+                                    // Map real traffic to Social quota for visibility in demo
+                                    let _ = self.simulate_usage(diff, QuotaType::Social);
+                                }
+                                last_bytes = bytes;
+                            }
+                        }
+                    }
+                }
+                thread::sleep(std::time::Duration::from_millis(500));
+            }
+        });
+    }
+}
 
-    fn notify_and_persist(&self, account: UserAccount) {
+impl TelcoSimulator {
+    fn notify_and_persist(&self, account: UserAccount, usage: Option<(u64, QuotaType, u64)>) {
         if let Some(handler) = &*self.update_handler.read() { handler.on_account_updated(account.clone()); }
-        persist_state_internal(&self.db_path, account);
+        let _ = self.persistence_tx.try_send(PersistenceMsg { account, usage });
     }
 }
 
@@ -179,30 +258,16 @@ impl UserAccount {
             if remaining == 0 { break; }
         }
         if remaining > 0 { return Err(TelcoError::InsufficientBalance); }
-        Ok(Self { buckets: new_buckets, ..self.clone() })
+        let total: u64 = new_buckets.iter().map(|b| b.remaining_bytes).sum();
+        Ok(Self { 
+            buckets: new_buckets, 
+            data_balance_bytes: total,
+            ..self.clone() 
+        })
     }
 }
 
-// --- Internal persistence logic ---
-fn persist_state_internal(db_path: &str, account: UserAccount) {
-    let path = db_path.to_string();
-    thread::spawn(move || {
-        if let Ok(mut conn) = Connection::open(path) {
-            if let Ok(tx) = conn.transaction() {
-                let _ = tx.execute("INSERT OR REPLACE INTO accounts (id, is_active, locked, last_traffic) VALUES (?1, ?2, ?3, ?4)", 
-                    params![account.id, account.is_active, account.biometric_locked, account.last_traffic_bytes]);
-                let _ = tx.execute("DELETE FROM buckets WHERE account_id = ?1", params![account.id]);
-                for b in account.buckets {
-                    let _ = tx.execute(
-                        "INSERT INTO buckets (account_id, name, remaining_bytes, category, expiry) VALUES (?1, ?2, ?3, ?4, ?5)",
-                        params![account.id, b.name, b.remaining_bytes, format!("{:?}", b.category), b.expiry]
-                    );
-                }
-                let _ = tx.commit();
-            }
-        }
-    });
-}
+
 
 fn load_account_internal(conn: &Connection, id: &str) -> Result<UserAccount, TelcoError> {
     let mut stmt = conn.prepare("SELECT is_active, locked, last_traffic FROM accounts WHERE id = ?1").ok().ok_or(TelcoError::InternalError)?;
@@ -210,11 +275,19 @@ fn load_account_internal(conn: &Connection, id: &str) -> Result<UserAccount, Tel
         .unwrap_or((true, false, 0));
 
     let mut stmt = conn.prepare("SELECT name, remaining_bytes, category, expiry FROM buckets WHERE account_id = ?1").ok().ok_or(TelcoError::InternalError)?;
-    let buckets = stmt.query_map(params![id], |row| {
+    let buckets: Vec<QuotaBucket> = stmt.query_map(params![id], |row| {
         let cat_str: String = row.get(2)?;
         let category = match cat_str.as_str() { "Video" => QuotaType::Video, "Social" => QuotaType::Social, _ => QuotaType::General };
         Ok(QuotaBucket { name: row.get(0)?, remaining_bytes: row.get(1)?, category, expiry: row.get(3)? })
     }).ok().ok_or(TelcoError::InternalError)?.filter_map(|b| b.ok()).collect();
 
-    Ok(UserAccount { id: id.to_string(), is_active, biometric_locked: locked, buckets, last_traffic_bytes })
+    Ok(UserAccount { 
+        id: id.to_string(), 
+        is_active, 
+        biometric_locked: locked, 
+        buckets: buckets.clone(), 
+        last_traffic_bytes,
+        data_balance_bytes: buckets.iter().map(|b| b.remaining_bytes).sum(),
+        current_latency_ms: 46,
+    })
 }
