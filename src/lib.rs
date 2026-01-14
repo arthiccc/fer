@@ -50,6 +50,13 @@ pub struct UserAccount {
     pub current_latency_ms: u32,
 }
 
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct UsageRecord {
+    pub timestamp: u64,
+    pub amount: u64,
+    pub category: String,
+}
+
 #[uniffi::export(callback_interface)]
 pub trait TelcoLiveUpdateHandler: Send + Sync {
     fn on_account_updated(&self, account: UserAccount);
@@ -64,6 +71,7 @@ struct PersistenceMsg {
 #[derive(uniffi::Object)]
 pub struct TelcoSimulator {
     state: Arc<RwLock<UserAccount>>,
+    db_path: String,
     db_key: Arc<RwLock<Option<SecretString>>>,
     update_handler: RwLock<Option<Box<dyn TelcoLiveUpdateHandler>>>,
     persistence_tx: mpsc::SyncSender<PersistenceMsg>,
@@ -119,6 +127,7 @@ impl TelcoSimulator {
 
         Ok(Arc::new(Self { 
             state: Arc::new(RwLock::new(account)), 
+            db_path,
             db_key: Arc::new(RwLock::new(None)),
             update_handler: RwLock::new(None),
             persistence_tx: tx,
@@ -178,8 +187,32 @@ impl TelcoSimulator {
 
     // Insight Logic
     fn generate_insight(&self) -> String {
-        let total: u64 = self.state.read().buckets.iter().map(|b| b.remaining_bytes).sum();
-        format!("You have {:.2} GB remaining. Native Rust Engine is standing by.", total as f64 / 1e9)
+        let total = self.state.read().data_balance_bytes;
+        let daily_avg = self.calculate_daily_average().unwrap_or(0);
+        
+        let mut insight = format!("You have {:.2} GB remaining.", total as f64 / 1e9);
+        
+        if daily_avg > 0 {
+            let days_left = total / daily_avg;
+            insight += &format!(" Based on last 7 days, you have roughly {} days of usage left.", days_left);
+            if days_left < 3 {
+                insight += " Recommendation: Top up soon to avoid interruption.";
+            }
+        } else {
+            insight += " Start using data to see personalized forecasting.";
+        }
+        
+        insight
+    }
+
+    fn calculate_daily_average(&self) -> Result<u64, TelcoError> {
+        let conn = Connection::open(&self.db_path).map_err(|e| TelcoError::DatabaseError(e.to_string()))?;
+        let seven_days_ago = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() - (7 * 24 * 60 * 60);
+        
+        let mut stmt = conn.prepare("SELECT SUM(amount) FROM usage_history WHERE timestamp > ?1").map_err(|e| TelcoError::DatabaseError(e.to_string()))?;
+        let total_usage: u64 = stmt.query_row(params![seven_days_ago], |row| row.get(0)).unwrap_or(0);
+        
+        Ok(total_usage / 7)
     }
 
     fn parse_and_buy_topping(&self, command: String) -> Result<(), TelcoError> {
@@ -207,6 +240,24 @@ impl TelcoSimulator {
             Err(TelcoError::InvalidCommand("Try 'YouTube 2GB'".to_string()))
         }
     }
+    pub fn get_historical_usage(&self, limit: u32) -> Result<Vec<UsageRecord>, TelcoError> {
+        let conn = Connection::open(&self.db_path).map_err(|e| TelcoError::DatabaseError(e.to_string()))?;
+        let mut stmt = conn.prepare("SELECT timestamp, amount, category FROM usage_history ORDER BY timestamp DESC LIMIT ?1")
+            .map_err(|e| TelcoError::DatabaseError(e.to_string()))?;
+        
+        let records = stmt.query_map(params![limit], |row| {
+            Ok(UsageRecord {
+                timestamp: row.get(0)?,
+                amount: row.get(1)?,
+                category: row.get(2)?,
+            })
+        }).map_err(|e| TelcoError::DatabaseError(e.to_string()))?
+        .filter_map(|r| r.ok())
+        .collect();
+        
+        Ok(records)
+    }
+
     pub fn start_network_sensor(self: Arc<Self>) {
         thread::spawn(move || {
             let mut last_bytes = 0;
